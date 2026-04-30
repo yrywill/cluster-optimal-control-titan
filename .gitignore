@@ -1,0 +1,55 @@
+__pycache__
+.idea
+.DS_Store
+*.egg-info
+build
+outputs
+outputs/
+dist/*
+.vscode
+.vs
+
+# data and output directories
+data
+out
+wandb
+dataset/
+dataset-100k/
+buckets_10M/
+
+torchtitan/datasets/**/*.model
+
+# hf assets
+assets/hf/*
+assets/tokenizer/*
+torchtitan/experiments/flux/assets/*
+
+# temp files
+*.log
+error.json
+_remote_module_non_scriptable.py
+
+# Editor temporaries (VIM)
+[._]*.s[a-v][a-z]
+[._]*.sw[a-p]
+[._]s[a-rt-v][a-z]
+[._]ss[a-gi-z]
+[._]sw[a-p]
+Session.vim
+Sessionx.vim
+.netrwhist
+*~
+.~lock.*
+
+# macOS dir files
+.DS_Store
+
+# env files
+.env
+
+# Claude Code local configuration
+CLAUDE.local.md
+/test_*.py
+/debug_*.py
+CLAUDE_CONTEXT/
+/.claude/settings.local.json
