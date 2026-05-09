@@ -116,27 +116,79 @@ Output:
 
 ### 2. Pre-training with PMP reweighting
 
-Use torchtitan's standard launcher:
+Use the unified launch script (auto-detects node count):
 
 ```bash
-MODULE=cluster_data_selection CONFIG=llama3_3b_cluster \
-    ./run_train.sh \
-    --dataloader.bucket_dir=/path/to/buckets \
-    --cluster.dev.dev_dir=/path/to/mmlu_validation \
-    --cluster.pmp.update_interval=50 \
-    --cluster.pmp.lr=0.1 \
-    --cluster.pmp.temperature=0.5
+# 太极平台 start_cmd (自动适配任意节点数):
+bash torchtitan/experiments/cluster_data_selection/start_cluster_train.sh
 ```
 
-The trainer:
+Override hyperparameters via environment variables:
 
-1. Builds the torchtitan model + FSDP2 shards + optimizer as usual.
-2. Opens all bucket files, initialises cluster weights uniformly.
-3. Runs normal training steps (fully delegates to `Trainer.train_step`).
-4. Every `pmp.update_interval` steps, computes a new `grad_gamma_delta`
-   via CountSketch and pushes fresh cluster weights into the dataset.
+```bash
+TRAIN_LR=1e-4 TRAIN_STEPS=2000 PMP_LR=0.05 \
+    bash torchtitan/experiments/cluster_data_selection/start_cluster_train.sh
+```
 
-### 3. Debug without GPUs
+Key parameters (edit directly in the script or pass as env vars):
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `TRAIN_LR` | 3e-5 | Learning rate |
+| `TRAIN_STEPS` | 1000 | Total training steps |
+| `TRAIN_WARMUP_STEPS` | 200 | Warmup steps |
+| `TRAIN_LOCAL_BATCH_SIZE` | 16 | Per-GPU batch size |
+| `CKPT_INTERVAL` | 200 | Checkpoint save interval |
+| `PMP_UPDATE_INTERVAL` | 100 | PMP weight update frequency |
+| `PMP_LR` | 0.01 | PMP learning rate |
+| `PMP_TEMPERATURE` | 1 | Softmax temperature for sampling |
+| `BUCKET_DIR` | ... | Path to clustered buckets |
+| `DEV_DIR` | ... | Path to dev validation data |
+| `DUMP_FOLDER` | ... | Output directory |
+
+The trainer saves checkpoints in DCP format (fast, no hang). After training
+completes, **rank 0 automatically converts all DCP checkpoints to HF
+safetensors format** with complete `config.json`, tokenizer, etc.
+
+### 3. Post-training: DCP to HF conversion (manual)
+
+If training was interrupted or you need to re-convert checkpoints:
+
+```bash
+cd /apdcephfs_jn4/share_304380933/rongyiyu/code/torchtitan
+
+python3 scripts/convert_all_dcp_to_hf.py \
+    /path/to/output/checkpoint \
+    --model_flavor 3B \
+    --export_dtype bfloat16 \
+    --skip_existing \
+    --validate
+```
+
+This produces complete HF-compatible model directories:
+
+```
+checkpoint/global_step400/hf/
+├── config.json                         # Llama-3.2 config (matches official release)
+├── generation_config.json              # Generation defaults
+├── model-00001-of-00002.safetensors    # Weights shard 1 (bfloat16)
+├── model-00002-of-00002.safetensors    # Weights shard 2 (bfloat16)
+├── model.safetensors.index.json        # Weight-to-shard mapping
+├── special_tokens_map.json
+├── tokenizer.json
+└── tokenizer_config.json
+```
+
+Load directly with HuggingFace Transformers:
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model = AutoModelForCausalLM.from_pretrained("/path/to/global_step400/hf")
+tokenizer = AutoTokenizer.from_pretrained("/path/to/global_step400/hf")
+```
+
+### 4. Debug without GPUs
 
 torchtitan's fake backend works out-of-the-box:
 
@@ -148,7 +200,7 @@ NGPU=8 COMM_MODE=fake_backend \
     --cluster.dev.dev_dir=/path/to/tiny_dev
 ```
 
-### 4. Unit tests
+### 5. Unit tests
 
 ```bash
 pytest torchtitan/experiments/cluster_data_selection/tests/ -x

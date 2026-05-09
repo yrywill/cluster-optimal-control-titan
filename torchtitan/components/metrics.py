@@ -447,6 +447,7 @@ class MetricsProcessor(Configurable):
             tensorboard_logger = TensorBoardLogger(base_log_dir, tag)
             logger_container.add_logger(tensorboard_logger)
 
+
         if logger_container.number_of_loggers == 0:
             logger.debug("No loggers enabled, returning an empty LoggerContainer")
         return logger_container

@@ -602,11 +602,11 @@ class CheckpointManager(Configurable):
             self._save_last_step(curr_step)
             return
 
-        # If last_save_in_hf is enabled, save every interval checkpoint
-        # in HF format as well (model-only, same as last step).
+        # If last_save_in_hf is enabled, save an additional HF-format
+        # (model-only) checkpoint alongside the normal DCP checkpoint so that
+        # interval checkpoints are both resumable and inference-ready.
         if self.last_save_in_hf:
-            self._save_last_step(curr_step)
-            return
+            self._save_hf_snapshot(curr_step)
 
         states = self._flattened_model_states_sd()
         if self.async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM:
@@ -762,7 +762,7 @@ class CheckpointManager(Configurable):
             int: The step to load the checkpoint for.
         """
         folder = folder if folder else self.folder
-        pattern = r"step-(\d+)"
+        pattern = r"global_step(\d+)"
         step_counts = []
 
         if not os.path.isdir(folder):
@@ -774,9 +774,14 @@ class CheckpointManager(Configurable):
             safetensors_metadata_probe = os.path.join(
                 folder, filename, "model.safetensors.index.json"
             )
+            hf_safetensors_metadata_probe = os.path.join(
+                folder, filename, "hf", "model.safetensors.index.json"
+            )
             if match and os.path.isfile(dcp_metadata_probe):
                 step_counts.append(int(match.group(1)))
             elif match and os.path.isfile(safetensors_metadata_probe):
+                step_counts.append(int(match.group(1)))
+            elif match and os.path.isfile(hf_safetensors_metadata_probe):
                 step_counts.append(int(match.group(1)))
         if not step_counts:
             return -1
@@ -859,6 +864,29 @@ class CheckpointManager(Configurable):
             to_hf=self.last_save_in_hf,
         )
 
+    def _save_hf_snapshot(self, curr_step: int) -> None:
+        """Save model-only HF checkpoint for the given step.
+
+        Unlike _save_last_step, this does NOT replace the normal DCP save.
+        It produces an additional HF-format snapshot so that the checkpoint
+        directory contains both a resumable DCP checkpoint and an
+        inference-ready HF model directory.
+        """
+        states = self.states[MODEL].state_dict()
+        if self.export_dtype != torch.float32:
+            states = {k: v.to(self.export_dtype) for k, v in states.items()}
+        logger.info(
+            f"Saving an additional HF snapshot in {self.export_dtype} "
+            f"at step {curr_step}."
+        )
+        self.dcp_save(
+            states,
+            checkpoint_id=self._create_checkpoint_id(curr_step),
+            async_mode=AsyncMode.DISABLED,
+            enable_garbage_collection=False,
+            to_hf=True,
+        )
+
     def _should_save(self, curr_step: int, last_step: bool = False) -> bool:
         if not self.enable or self.load_only:
             return False
@@ -904,7 +932,7 @@ class CheckpointManager(Configurable):
         if self._should_purge():
             discovered_checkpoints = []
             for filename in os.listdir(self.folder):
-                match = re.search(r"step-(\d+)", filename)
+                match = re.search(r"global_step(\d+)", filename)
                 if match:
                     path = os.path.join(self.folder, filename)
                     discovered_checkpoints.append((int(match.group(1)), path))
