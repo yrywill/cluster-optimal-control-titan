@@ -28,7 +28,109 @@ every N grad steps:
 tens-of-GB for an explicit projection matrix) and is linear — so it stays
 correct when gradients are sharded under FSDP2.
 
-## Supported parallelism (first version)
+## Quick start
+
+### A. Baseline 预训练（无 PMP，纯随机采样）
+
+从零预训练 Llama3-3B，数据均匀随机采样：
+
+```bash
+bash torchtitan/experiments/cluster_data_selection/start_train_no_pmp.sh
+```
+
+参数说明：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `TRAIN_LR` | 3e-4 | 学习率（从零预训标准值） |
+| `TRAIN_STEPS` | 19000 | 训练步数（~160B tokens） |
+| `TRAIN_SEQ_LEN` | 4096 | 序列长度（自动 packing，不浪费） |
+| `TRAIN_WARMUP_STEPS` | 2000 | Warmup 步数 |
+| `TRAIN_LOCAL_BATCH_SIZE` | 16 | 每 GPU batch size |
+| `CKPT_INTERVAL` | 1000 | DCP checkpoint 保存间隔 |
+| `BUCKET_DIR` | .../data_bucketed_by_semddp/final | 数据集路径 |
+
+特性：
+- 模型架构 = Llama3-3B（dim=3072, 28层, 24头），权重随机初始化
+- 采样权重按 cluster 大小成比例（等价于全数据集均匀随机）
+- Checkpoint 只存 DCP 格式（快速，不会 hang）
+- 支持 SwanLab 实时 loss 画图
+- 环境变量覆盖：`TRAIN_LR=1e-4 TRAIN_STEPS=5000 bash start_train_no_pmp.sh`
+
+### B. PMP 数据选择训练
+
+使用 PMP 动态调整 cluster 采样权重：
+
+```bash
+bash torchtitan/experiments/cluster_data_selection/start_cluster_train.sh
+```
+
+参数说明：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `TRAIN_LR` | 3e-4 | 学习率 |
+| `TRAIN_STEPS` | 19000 | 训练步数 |
+| `TRAIN_LOCAL_BATCH_SIZE` | 4 | 每 GPU batch size |
+| `GRAD_ACC_STEPS` | 2 | 梯度累积步数 |
+| `PMP_UPDATE_INTERVAL` | 100 | PMP 权重更新频率（steps） |
+| `PMP_LR` | 0.01 | PMP 学习率 |
+| `PMP_TEMPERATURE` | 1 | Softmax 温度 |
+| `PMP_SKETCH_DIM` | 8192 | CountSketch 维度 |
+| `BUCKET_DIR` | ... | 聚类数据目录 |
+| `DEV_DIR` | ... | Dev 验证集目录 |
+
+训练结束后 node 0 自动将 DCP checkpoint 转换为 HF 格式。
+
+### C. DCP → HF 模型转换
+
+训练完成后（或训练中断后），独立执行 checkpoint 格式转换：
+
+```bash
+# 在任意机器上执行（不需要 GPU，需要 ~12GB CPU 内存）
+bash torchtitan/experiments/cluster_data_selection/convert_checkpoint.sh \
+    /path/to/output/checkpoint
+```
+
+或者用 Python 脚本（更多选项）：
+
+```bash
+python3 scripts/convert_all_dcp_to_hf.py \
+    /path/to/output/checkpoint \
+    --model_flavor 3B \
+    --export_dtype bfloat16 \
+    --hf_assets_path /path/to/llama-3.2-3B \
+    --tokenizer_path /path/to/llama-3.2-3B \
+    --skip_existing \
+    --validate
+```
+
+转换后的目录结构（和官方 Llama-3.2-3B 发布一致）：
+
+```
+checkpoint/global_step1000/hf/
+├── config.json                         # 模型配置
+├── generation_config.json              # 生成配置
+├── model-00001-of-00002.safetensors    # 权重 shard 1
+├── model-00002-of-00002.safetensors    # 权重 shard 2
+├── model.safetensors.index.json        # 权重索引
+├── special_tokens_map.json
+├── tokenizer.json
+└── tokenizer_config.json
+```
+
+加载转换后的模型：
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model = AutoModelForCausalLM.from_pretrained("/path/to/global_step1000/hf")
+tokenizer = AutoTokenizer.from_pretrained("/path/to/global_step1000/hf")
+```
+
+---
+
+## Supported parallelism
 
 | Parallelism | Status |
 | --- | --- |
@@ -38,43 +140,35 @@ correct when gradients are sharded under FSDP2.
 | Context Parallel (`cp > 1`) | ❌ Rejected at config time |
 | Expert Parallel (`ep > 1`) | ❌ Rejected at config time |
 
-The PMP path relies on `torch.autograd.grad` over the whole model on every
-rank; the non-DP meshes need further work before they can be validated
-numerically.  Guard rails in `ClusterSelectionTrainer.Config.__post_init__`
-refuse unsupported configurations instead of silently mis-computing.
-
 ## Files
 
 ```
 cluster_data_selection/
 ├── trainer.py                  # ClusterSelectionTrainer (subclass of Trainer)
 ├── config_registry.py          # llama3_debug_cluster / llama3_3b_cluster / ...
-├── config/job_config.py        # ClusterConfig, PMPConfig, DevDataConfig, ClusteringConfig
+├── config/job_config.py        # ClusterConfig, PMPConfig, DevDataConfig
 ├── data/
-│   ├── bucketed_dataset.py     # IterableDataset over pre-bucketed JSONL
-│   ├── dataloader.py           # ClusterDataLoader (wraps ParallelAwareDataloader)
+│   ├── bucketed_dataset.py     # IterableDataset over pre-bucketed JSONL (token packing)
+│   ├── dataloader.py           # ClusterDataLoader
 │   └── dev_dataset.py          # DevBatchCache for PMP's dev gradient
 ├── pmp/
 │   ├── count_sketch.py         # CountSketchProjector (FSDP2 DTensor-aware)
 │   ├── grad_utils_sketch.py    # compute_cluster_contributions_sketch
 │   └── weight_state.py         # ClusterWeightState (softmax + bad-cluster drop)
-├── clustering/kmeans.py        # MiniBatch / Full / Faiss wrappers (offline only)
 ├── scripts/prepare_clusters.py # Offline: raw JSONL → bucket_XXXX.jsonl + meta.json
+├── start_train_no_pmp.sh       # 启动脚本：baseline 训练（无 PMP）
+├── start_cluster_train.sh      # 启动脚本：PMP 训练 + 自动转换
+├── convert_checkpoint.sh       # 启动脚本：独立 DCP→HF 转换
 └── tests/
     ├── test_count_sketch.py
     └── test_bucketed_dataset.py
 ```
 
-## End-to-end usage
+## End-to-end workflow
 
 ### 0. (Optional) Download a public corpus
 
-If you don't have a JSONL corpus handy, ``scripts.download_dclm`` pulls
-[DCLM-baseline-1.0](https://huggingface.co/datasets/mlfoundations/dclm-baseline-1.0)
-and slims each record to ``{"text": ..., "url": ...}`` ready for clustering:
-
 ```bash
-# Behind a firewall, set HF_ENDPOINT to a mirror before running.
 HF_ENDPOINT=https://hf-mirror.com \
 python3 -m torchtitan.experiments.cluster_data_selection.scripts.download_dclm \
     --output_dir /path/to/dclm_raw \
@@ -84,14 +178,9 @@ python3 -m torchtitan.experiments.cluster_data_selection.scripts.download_dclm \
     --keep_url
 ```
 
-Each upstream shard yields ~61k records and ~5 MB of slimmed JSONL.  The
-script is resumable: interrupted files are left as ``*.part`` and skipped
-unless you pass ``--overwrite``.
-
 ### 1. Offline clustering & bucketing
 
-Run once per corpus.  Touches HuggingFace Transformers / sklearn; the
-online trainer does not.
+Run once per corpus:
 
 ```bash
 python -m torchtitan.experiments.cluster_data_selection.scripts.prepare_clusters \
@@ -108,89 +197,31 @@ Output:
 ```
 /path/to/buckets/
 ├── meta.json              # num_clusters, cluster_sizes, ...
-├── cluster_ids.npy        # int32 [N]
-├── bucket_0000.jsonl
 ├── bucket_0001.jsonl
+├── bucket_0002.jsonl
 └── ...
 ```
 
-### 2. Pre-training with PMP reweighting
+### 2. Training
 
-Use the unified launch script (auto-detects node count):
+Choose one:
 
 ```bash
-# 太极平台 start_cmd (自动适配任意节点数):
+# A. Baseline（无 PMP，纯随机）
+bash torchtitan/experiments/cluster_data_selection/start_train_no_pmp.sh
+
+# B. PMP 数据选择
 bash torchtitan/experiments/cluster_data_selection/start_cluster_train.sh
 ```
 
-Override hyperparameters via environment variables:
+### 3. Convert checkpoints to HF format
 
 ```bash
-TRAIN_LR=1e-4 TRAIN_STEPS=2000 PMP_LR=0.05 \
-    bash torchtitan/experiments/cluster_data_selection/start_cluster_train.sh
-```
-
-Key parameters (edit directly in the script or pass as env vars):
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `TRAIN_LR` | 3e-5 | Learning rate |
-| `TRAIN_STEPS` | 1000 | Total training steps |
-| `TRAIN_WARMUP_STEPS` | 200 | Warmup steps |
-| `TRAIN_LOCAL_BATCH_SIZE` | 16 | Per-GPU batch size |
-| `CKPT_INTERVAL` | 200 | Checkpoint save interval |
-| `PMP_UPDATE_INTERVAL` | 100 | PMP weight update frequency |
-| `PMP_LR` | 0.01 | PMP learning rate |
-| `PMP_TEMPERATURE` | 1 | Softmax temperature for sampling |
-| `BUCKET_DIR` | ... | Path to clustered buckets |
-| `DEV_DIR` | ... | Path to dev validation data |
-| `DUMP_FOLDER` | ... | Output directory |
-
-The trainer saves checkpoints in DCP format (fast, no hang). After training
-completes, **rank 0 automatically converts all DCP checkpoints to HF
-safetensors format** with complete `config.json`, tokenizer, etc.
-
-### 3. Post-training: DCP to HF conversion (manual)
-
-If training was interrupted or you need to re-convert checkpoints:
-
-```bash
-cd /apdcephfs_jn4/share_304380933/rongyiyu/code/torchtitan
-
-python3 scripts/convert_all_dcp_to_hf.py \
-    /path/to/output/checkpoint \
-    --model_flavor 3B \
-    --export_dtype bfloat16 \
-    --skip_existing \
-    --validate
-```
-
-This produces complete HF-compatible model directories:
-
-```
-checkpoint/global_step400/hf/
-├── config.json                         # Llama-3.2 config (matches official release)
-├── generation_config.json              # Generation defaults
-├── model-00001-of-00002.safetensors    # Weights shard 1 (bfloat16)
-├── model-00002-of-00002.safetensors    # Weights shard 2 (bfloat16)
-├── model.safetensors.index.json        # Weight-to-shard mapping
-├── special_tokens_map.json
-├── tokenizer.json
-└── tokenizer_config.json
-```
-
-Load directly with HuggingFace Transformers:
-
-```python
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-model = AutoModelForCausalLM.from_pretrained("/path/to/global_step400/hf")
-tokenizer = AutoTokenizer.from_pretrained("/path/to/global_step400/hf")
+bash torchtitan/experiments/cluster_data_selection/convert_checkpoint.sh \
+    /path/to/output/checkpoint
 ```
 
 ### 4. Debug without GPUs
-
-torchtitan's fake backend works out-of-the-box:
 
 ```bash
 NGPU=8 COMM_MODE=fake_backend \
@@ -206,10 +237,22 @@ NGPU=8 COMM_MODE=fake_backend \
 pytest torchtitan/experiments/cluster_data_selection/tests/ -x
 ```
 
-The CountSketch and bucketed-dataset tests run entirely on CPU and require
-only numpy / torch.
-
 ## Implementation notes
+
+### Token packing
+
+The dataloader uses greedy concatenation packing: short samples are
+concatenated in a token buffer until `seq_len` is reached, then a window
+is emitted. No padding, no wasted positions. Long samples are split across
+multiple windows.
+
+### Sampling weights
+
+- **Without PMP**: weights are proportional to cluster size (equivalent to
+  uniform random sampling from the full dataset, prevents over-fitting
+  on tiny clusters).
+- **With PMP**: weights are dynamically updated every `update_interval`
+  steps based on gradient alignment with the dev set.
 
 ### PMP under FSDP2
 
@@ -217,44 +260,25 @@ only numpy / torch.
   over the batch mesh.  `CountSketchProjector._materialize` handles this
   transparently via `DTensor.full_tensor(grad_placements=[Replicate()])`.
 * We call `torch.autograd.grad(loss, params)` instead of `loss.backward()`
-  to avoid double-firing FSDP2's reduce-scatter hooks during PMP.  Forward
-  still fires FSDP2's gather hooks as designed.
-* Work distribution across DP ranks uses both the dev-batch sharding
-  (`dev_batches[r::dp_world_size]`) and the cluster sharding
-  (`clusters[r::dp_world_size]`), each followed by an all-reduce on the
-  batch mesh.  No double counting because each cluster is visited by
-  exactly one rank.
+  to avoid double-firing FSDP2's reduce-scatter hooks during PMP.
+* Work distribution across DP ranks uses both dev-batch sharding and
+  cluster sharding, each followed by an all-reduce on the batch mesh.
 
 ### Checkpointing
 
-`ClusterSelectionTrainer.state_dict` includes `cluster_weight_state` so
-PMP's accumulated `grad_gamma`, current weights, negative-streak counters,
-and dead-cluster flags all survive DCP saves/loads.  The bucketed dataset
-itself is `Stateful` and persists its draw index + packing buffer through
-`ParallelAwareDataloader`'s normal mechanism.
+* Training saves DCP format only (fast, avoids NCCL hang on shared FS).
+* HF conversion is done post-training on a single node (CPU only).
+* `ClusterSelectionTrainer.state_dict` includes `cluster_weight_state` so
+  PMP's accumulated `grad_gamma`, current weights, and dead-cluster flags
+  all survive DCP saves/loads.
 
-### Why offline bucketing?
+### SwanLab integration
 
-Training-time in-memory clustering (the original repo's default for small
-corpora) is not scalable: 10M+ samples would dominate startup.  Offline
-bucketing:
+Loss curves are automatically logged to SwanLab when enabled via
+`--metrics.enable-swanlab`. Configure via environment variables:
 
-* Makes the online trainer **completely independent** of sklearn, faiss,
-  and HuggingFace Transformers — keeping torchtitan's experiment folder
-  reproducible and lean.
-* Lets multiple training runs share the same clustering artefact.
-* Allows the offline script to be run on arbitrarily large hardware
-  without blocking the training launch.
-
-## Things intentionally left out
-
-* **Ghost projection / ring-buffer JVP paths**: the original repo's
-  `CountSketch` fast path supersedes them and the JVP path drags in a lot
-  of complexity.  We keep only the fast path for the first version.
-* **Online re-clustering (`recluster_interval`)**: skipped; rerun
-  `prepare_clusters` and restart training if you need a fresh bucketing.
-* **Multi-domain dev weighting (`DevDomainManager`)**: the dev set is a
-  single folder.  Re-introduce if a specific experiment requires domain
-  reweighting of the PMP objective.
-* **DeepSpeed**: torchtitan uses FSDP2 natively; the DeepSpeed branch of
-  the original repo is obsolete here.
+```bash
+export SWANLAB_API_KEY="your_key"
+export SWANLAB_PROJECT="llama3-3b-pretrain"
+export SWANLAB_EXPERIMENT_NAME="run_name"
+```
