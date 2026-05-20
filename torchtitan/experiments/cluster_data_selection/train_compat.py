@@ -1,20 +1,17 @@
-"""Entry point for cluster_data_selection training (PyTorch 2.5 compatible).
+"""Entry point for cluster_data_selection on PyTorch 2.5.1+cu121.
 
-Imports the compat shim FIRST to patch missing APIs, then runs the trainer.
+Usage (in launch script):
+    torchrun ... -m torchtitan.experiments.cluster_data_selection.train_compat \
+        --module cluster_data_selection --config llama3_3b_cluster_16gpu ...
+
+This module applies the compatibility shim BEFORE any torchtitan core imports,
+allowing the training to run on NVIDIA driver 535 (CUDA 12.1/12.2).
 """
 
-# Must be first import — patches torch APIs for PyTorch 2.5.x
+# Apply compat patches FIRST — must precede any torchtitan import.
 import torchtitan.experiments.cluster_data_selection.compat_shim  # noqa: F401
 
-from torchtitan.experiments.cluster_data_selection.trainer import (
-    ClusterSelectionTrainer,
-)
-
-
-def main():
-    trainer = ClusterSelectionTrainer(ClusterSelectionTrainer.build_config())
-    trainer.train()
-
+from torchtitan.train import main  # noqa: E402
 
 if __name__ == "__main__":
     main()
