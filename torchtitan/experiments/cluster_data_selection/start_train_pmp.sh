@@ -31,7 +31,7 @@ BUCKET_DIR=${BUCKET_DIR:-"/apdcephfs_jn5/share_304380933/rongyiyu/data_sampled_3
 DEV_DIR=${DEV_DIR:-"/apdcephfs_jn4/share_304380933/rongyiyu/code/cluster_data_selection/valid_3shot"}
 
 # --- PMP hyperparameters ---
-PMP_UPDATE_INTERVAL=${PMP_UPDATE_INTERVAL:-"100"}
+PMP_UPDATE_INTERVAL=${PMP_UPDATE_INTERVAL:-"1000"}
 PMP_LR=${PMP_LR:-"0.01"}
 PMP_TEMPERATURE=${PMP_TEMPERATURE:-"1"}
 PMP_SKETCH_DIM=${PMP_SKETCH_DIM:-"8192"}

@@ -92,9 +92,11 @@ cluster-optimal-control-titan/
 
 ### Cluster Data Selection (PMP)
 - **Offline clustering & bucketing**: Pre-process corpus into K clusters via KMeans
+- **Binary mmap format**: Pre-tokenize clusters → `.bin` files for zero I/O overhead (2.8x speedup vs JSONL)
+- **Centralized sampling**: Rank 0 does global weighted draw → broadcast → each rank reads non-overlapping data (zero duplication)
 - **Online PMP reweighting**: Dynamically adjust cluster sampling weights during training
 - **CountSketch projector**: Memory-efficient gradient projection (~60 MB), FSDP2 DTensor-aware
-- **Checkpointable state**: PMP weights, grad_gamma, and dead-cluster flags survive DCP saves/loads
+- **Checkpointable state**: PMP weights, grad_gamma, cursors, and dead-cluster flags survive DCP saves/loads
 
 ### Inherited from torchtitan
 - **Multi-dimensional parallelism**: FSDP2, Tensor Parallel (async TP), Pipeline Parallel, Context Parallel
@@ -138,23 +140,134 @@ python -m torchtitan.experiments.cluster_data_selection.scripts.prepare_clusters
     --shuffle_within_bucket
 ```
 
-### Step 2: Pre-training with PMP Reweighting
+### Step 1.5: Convert to Binary Format (Recommended)
+
+Pre-tokenize all clusters into binary `.bin` files for **zero-overhead mmap** reading at training time (no JSON parse, no tokenize, ~2.8x faster):
 
 ```bash
-MODULE=cluster_data_selection CONFIG=llama3_3b_cluster \
+python -m torchtitan.experiments.cluster_data_selection.scripts.prepare_bins \
+    --bucket_dir /path/to/buckets \
+    --tokenizer_path /path/to/llama-3.2-3B \
+    --num_workers 32
+```
+
+This creates `bucket_XXXX.bin` files alongside existing JSONL and updates `meta.json` with `"format": "bin"`. The dataloader auto-detects the format at runtime.
+
+### Step 2: Pre-training with PMP Reweighting
+
+#### Taiji Platform — 64 GPUs (8 nodes)
+
+```bash
+# PMP enabled, bin format auto-detected
+HOST_NUM=8 \
+TRAIN_LOCAL_BATCH_SIZE=4 \
+GRAD_ACCUM_STEPS=4 \
+BUCKET_DIR=/path/to/buckets \
+DUMP_FOLDER=/path/to/output/train_pmp \
+bash torchtitan/experiments/cluster_data_selection/start_train_pmp.sh
+```
+
+Global batch = 4 × 4 × 8 × 8 = 1024. PMP updates every 1000 steps.
+
+#### Without PMP (baseline, size-proportional sampling)
+
+```bash
+HOST_NUM=8 \
+TRAIN_LOCAL_BATCH_SIZE=4 \
+GRAD_ACCUM_STEPS=4 \
+BUCKET_DIR=/path/to/buckets \
+DUMP_FOLDER=/path/to/output/train_no_pmp \
+bash torchtitan/experiments/cluster_data_selection/start_train_no_pmp_fix.sh
+```
+
+#### Single Node — 8 GPUs
+
+```bash
+NGPU=8 MODULE=cluster_data_selection CONFIG=llama3_3b_cluster \
     ./run_train.sh \
+    --dataloader.bucket_dir=/path/to/buckets \
+    --cluster.dev.dev_dir=/path/to/mmlu_validation \
+    --cluster.pmp.enabled \
+    --cluster.pmp.update_interval=1000 \
+    --cluster.pmp.lr=0.01 \
+    --cluster.pmp.temperature=1
+```
+
+#### 2 Nodes — 16 GPUs
+
+```bash
+# Run on EACH of the 2 nodes (set MASTER_ADDR to node 0's IP):
+PYTORCH_ALLOC_CONF="expandable_segments:True" \
+torchrun --nproc_per_node=8 --nnodes=2 \
+    --node_rank=$NODE_RANK \
+    --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:29500 \
+    --local-ranks-filter 0 --role rank --tee 3 \
+    -m torchtitan.train \
+    --module cluster_data_selection --config llama3_3b_cluster \
     --dataloader.bucket_dir=/path/to/buckets \
     --cluster.dev.dev_dir=/path/to/mmlu_validation \
     --cluster.pmp.update_interval=50 \
     --cluster.pmp.lr=0.1 \
-    --cluster.pmp.temperature=0.5
+    --cluster.pmp.temperature=0.5 \
+    --parallelism.data_parallel_shard_degree=-1
+```
+
+#### 16 Nodes — 128 GPUs
+
+```bash
+# Run on EACH of the 16 nodes (set MASTER_ADDR to node 0's IP):
+PYTORCH_ALLOC_CONF="expandable_segments:True" \
+torchrun --nproc_per_node=8 --nnodes=16 \
+    --node_rank=$NODE_RANK \
+    --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:29500 \
+    --local-ranks-filter 0 --role rank --tee 3 \
+    -m torchtitan.train \
+    --module cluster_data_selection --config llama3_8b_cluster \
+    --dataloader.bucket_dir=/path/to/buckets \
+    --cluster.dev.dev_dir=/path/to/mmlu_validation \
+    --cluster.pmp.update_interval=100 \
+    --cluster.pmp.lr=0.1 \
+    --cluster.pmp.temperature=0.5 \
+    --parallelism.data_parallel_shard_degree=-1
+```
+
+> **Note**: `--parallelism.data_parallel_shard_degree=-1` auto-computes the FSDP shard degree from `world_size / (dp_replicate * cp * tp * pp)`. For HSDP (replicate + shard), set both explicitly, e.g. `--parallelism.data_parallel_replicate_degree=2 --parallelism.data_parallel_shard_degree=64` for 128 GPUs.
+
+#### SLURM Multi-Node Launch
+
+For clusters managed by SLURM, create a job script:
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=pmp-train
+#SBATCH --nodes=16
+#SBATCH --ntasks-per-node=8
+#SBATCH --gpus-per-node=8
+
+export MASTER_ADDR=$(scontrol show hostname $SLURM_NODELIST | head -n1)
+export MASTER_PORT=29500
+
+srun torchrun --nproc_per_node=8 --nnodes=16 \
+    --node_rank=$SLURM_NODEID \
+    --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+    -m torchtitan.train \
+    --module cluster_data_selection --config llama3_8b_cluster \
+    --dataloader.bucket_dir=/path/to/buckets \
+    --cluster.dev.dev_dir=/path/to/mmlu_validation \
+    --parallelism.data_parallel_shard_degree=-1
 ```
 
 ### Step 3: Standard torchtitan Training (without PMP)
 
 ```bash
-# Llama 3 8B on 8 GPUs
-MODULE=llama3 CONFIG=llama3_8b ./run_train.sh
+# Llama 3 8B on 8 GPUs (single node)
+NGPU=8 MODULE=llama3 CONFIG=llama3_8b ./run_train.sh
+
+# Llama 3 8B on 16 GPUs (2 nodes)
+torchrun --nproc_per_node=8 --nnodes=2 \
+    --node_rank=$NODE_RANK \
+    --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:29500 \
+    -m torchtitan.train --module llama3 --config llama3_8b
 ```
 
 ### Debug without GPUs
@@ -165,14 +278,6 @@ NGPU=8 COMM_MODE=fake_backend \
     ./run_train.sh \
     --dataloader.bucket_dir=/path/to/small_buckets \
     --cluster.dev.dev_dir=/path/to/tiny_dev
-```
-
-### Multi-Node Training (SLURM)
-
-Adjust node/GPU count in `multinode_trainer.slurm`, then:
-
-```bash
-sbatch multinode_trainer.slurm
 ```
 
 ## Supported Parallelism for PMP
