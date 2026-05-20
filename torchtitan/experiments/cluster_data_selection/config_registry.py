@@ -173,6 +173,7 @@ def llama3_3b_cluster_16gpu() -> ClusterSelectionTrainer.Config:
     Global tokens/step = 128 * 2048 = 262,144.
     """
     cfg = llama3_debug_cluster()
+    cfg.hf_assets_path = "/apdcephfs_jn4/share_304380933/rongyiyu/code/llama-3.2-3B"
     cfg.model_spec = model_registry("3B")
     cfg.dump_folder = "/apdcephfs_jn5/share_304380933/rongyiyu/output"
     cfg.training = TrainingConfig(

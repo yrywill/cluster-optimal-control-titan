@@ -40,7 +40,11 @@ from pathlib import Path
 
 import torch
 import torch.distributed.checkpoint as dcp
-from torch.distributed.checkpoint import HuggingFaceStorageWriter
+
+try:
+    from torch.distributed.checkpoint import HuggingFaceStorageWriter
+except ImportError:
+    from torch.distributed.checkpoint import _HuggingFaceStorageWriter as HuggingFaceStorageWriter
 
 # Add repo root to path
 SCRIPT_DIR = Path(__file__).resolve().parent

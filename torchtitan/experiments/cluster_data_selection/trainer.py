@@ -35,6 +35,7 @@ import torch
 
 from torch.distributed.elastic.multiprocessing.errors import record
 
+from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.tools.logging import logger
 from torchtitan.trainer import Trainer
 
@@ -116,10 +117,13 @@ class ClusterSelectionTrainer(Trainer):
         self.cluster_config = config.cluster
         pmp_cfg = config.cluster.pmp
 
-        # Reach into the dataloader to grab the BucketedClusterDataset; we
-        # validated the type in Config.__post_init__.
+        # Inject the data-parallel process group into the centralized
+        # dataloader (not available at config.build() time).
         cluster_loader = self.dataloader
         assert isinstance(cluster_loader, ClusterDataLoader)
+        if self.parallel_dims.dp_enabled:
+            batch_mesh = self.parallel_dims.get_mesh("batch")
+            cluster_loader._dp_pg = batch_mesh.get_group()
         self._cluster_dataset_ref = cluster_loader.cluster_dataset
         num_clusters = self._cluster_dataset_ref.num_clusters
 
@@ -131,9 +135,15 @@ class ClusterSelectionTrainer(Trainer):
             drop_bad_clusters=pmp_cfg.drop_bad_clusters,
             drop_patience=pmp_cfg.drop_patience,
         )
-        # Ensure the dataset starts sampling from the canonical uniform
-        # distribution (redundant but explicit).
-        self._cluster_dataset_ref.update_weights(self.cluster_weight_state.weights)
+        # Initialize weights proportional to cluster size (not uniform!).
+        # This avoids over-sampling tiny clusters and under-sampling large ones.
+        # The dataset already initializes with size-proportional weights;
+        # sync the weight_state to match so PMP updates start from the correct
+        # baseline rather than overwriting with uniform.
+        size_weights = self._cluster_dataset_ref.cluster_sizes.astype(float)
+        size_weights = size_weights / size_weights.sum()
+        self.cluster_weight_state.weights = size_weights
+        self._cluster_dataset_ref.update_weights(size_weights)
 
         self.count_sketch = CountSketchProjector(
             sketch_dim=pmp_cfg.sketch_dim,
@@ -141,14 +151,33 @@ class ClusterSelectionTrainer(Trainer):
         )
 
         # Dev cache requires a tokenizer.  torchtitan has already built one.
-        self.dev_cache = DevBatchCache(
-            dev_dir=config.cluster.dev.dev_dir,
-            tokenizer=self.tokenizer,
-            text_field=config.cluster.dev.text_field,
-            max_length=config.cluster.dev.max_length,
-            max_samples=config.cluster.dev.max_samples,
-            batch_size=pmp_cfg.dev_batch_size,
+        # Skip dev cache creation if PMP will never fire (disabled or
+        # update_interval >= total training steps), allowing training without
+        # a dev set.
+        pmp_will_fire = (
+            pmp_cfg.enabled
+            and pmp_cfg.update_interval > 0
+            and pmp_cfg.update_interval < config.training.steps
         )
+        if pmp_will_fire:
+            self.dev_cache = DevBatchCache(
+                dev_dir=config.cluster.dev.dev_dir,
+                tokenizer=self.tokenizer,
+                text_field=config.cluster.dev.text_field,
+                max_length=config.cluster.dev.max_length,
+                max_samples=config.cluster.dev.max_samples,
+                batch_size=pmp_cfg.dev_batch_size,
+            )
+        else:
+            self.dev_cache = None
+            logger.info(
+                "[ClusterSelectionTrainer] PMP will not fire "
+                "(enabled=%s, update_interval=%d, steps=%d); "
+                "skipping dev cache.",
+                pmp_cfg.enabled,
+                pmp_cfg.update_interval,
+                config.training.steps,
+            )
 
         logger.info(
             "[ClusterSelectionTrainer] ready: num_clusters=%d, PMP enabled=%s, "
@@ -166,6 +195,8 @@ class ClusterSelectionTrainer(Trainer):
         if not pmp.enabled:
             return False
         if pmp.update_interval <= 0:
+            return False
+        if self.dev_cache is None:
             return False
         return (self.step % pmp.update_interval) == 0
 

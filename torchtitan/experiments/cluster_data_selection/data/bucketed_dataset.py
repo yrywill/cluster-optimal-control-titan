@@ -94,10 +94,11 @@ class BucketedClusterDataset(IterableDataset, Stateful):
         seed: Base seed for the cluster-draw RNG (shifted by epoch).
         infinite: If True, re-open buckets forever.
 
-    The dataset is designed so every rank arrives at the same *cluster
-    sequence* given the same weights and seed; only the yielded slice
-    differs between ranks.  This lets PMP weight updates broadcast
-    trivially — every rank recomputes the same cluster-draw order.
+    Each rank independently draws clusters according to the current
+    weight distribution with its own RNG (seeded by ``seed + dp_rank``).
+    This means different GPUs see different cluster sequences at the same
+    step, maximising data diversity while respecting the same sampling
+    distribution.
     """
 
     def __init__(
@@ -151,11 +152,11 @@ class BucketedClusterDataset(IterableDataset, Stateful):
                 self._num_clusters, 1
             )
 
-        # RNG state — seed is offset by DP rank for data diversity across
-        # ranks, BUT cluster-draw RNG uses the shared seed so every rank
-        # samples the same cluster sequence (only the rank's own slice is
-        # yielded).  The two RNGs are independent.
-        self._cluster_rng = random.Random(seed)
+        # RNG state — each rank uses a DIFFERENT seed so that cluster draws
+        # and within-cluster draws are fully independent across GPUs.
+        # This ensures maximum data diversity while respecting the same
+        # weight distribution.
+        self._cluster_rng = random.Random(seed + dp_rank)
         self._within_cluster_rng = random.Random(seed + 10_000 + dp_rank)
 
         self._step = 0  # global draw index (shared across ranks)
@@ -331,18 +332,7 @@ class BucketedClusterDataset(IterableDataset, Stateful):
             # Produce exactly one packed window per outer loop iteration.
             while len(self._token_buffer) < max_buffer:
                 cluster_id = self._draw_cluster()
-                step = self._step
                 self._step += 1
-
-                # Only THIS rank's slice is actually tokenised & yielded;
-                # other ranks advance the same RNG in lock-step and will
-                # process their own slice on their side.
-                if step % self._dp_world_size != self._dp_rank:
-                    # Still need to advance the corresponding bucket file so
-                    # the workload is balanced across ranks; skipping file
-                    # reads is fine because each rank owns an independent
-                    # view of the buckets (multi-open is OK in POSIX).
-                    continue
 
                 text = self._read_next_line(cluster_id)
                 if text is None:
@@ -368,6 +358,56 @@ class BucketedClusterDataset(IterableDataset, Stateful):
             ):
                 # Safety break for non-infinite smoke tests.
                 break
+
+    # ------------------------------------------------------------------
+    # Centralized sampling helper: read a specific line by global index
+    # ------------------------------------------------------------------
+    def read_line_at(self, cluster_id: int, global_line_idx: int) -> str | None:
+        """Read the text at a specific global line index from a cluster.
+
+        Wraps around if the index exceeds cluster size (for infinite mode).
+        Uses a separate file handle to not disturb the streaming iterator.
+
+        Args:
+            cluster_id: Which cluster bucket to read from.
+            global_line_idx: The absolute line number (0-indexed) to read.
+
+        Returns:
+            The text string, or None if the line is empty/invalid.
+        """
+        if not (0 <= cluster_id < self._num_clusters):
+            return None
+
+        cluster_size = int(self._cluster_sizes[cluster_id])
+        if cluster_size == 0:
+            return None
+
+        # Wrap around for infinite mode
+        actual_idx = global_line_idx % cluster_size
+
+        # Build offset index if needed (for seeking)
+        offsets = self._line_offsets[cluster_id]
+        if offsets is None:
+            offsets = self._build_line_offsets(cluster_id)
+
+        if not offsets or actual_idx >= len(offsets):
+            return None
+
+        # Open a temporary handle or reuse the main one
+        path = self._bucket_files[cluster_id]
+        with open(path, "r", encoding="utf-8") as f:
+            f.seek(offsets[actual_idx])
+            line = f.readline()
+
+        if not line:
+            return None
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(obj, dict) and self._text_field in obj:
+            return obj[self._text_field]
+        return None
 
     # ------------------------------------------------------------------
     # Stateful interface (DCP checkpointing)
