@@ -191,9 +191,9 @@ TRAIN_ARGS=(
     --checkpoint.interval=${CKPT_INTERVAL}
     --checkpoint.keep_latest_k=0
     --checkpoint.no-last-save-in-hf
-    # Dataset - random within-bucket sampling
+    # Dataset - sequential within-bucket (bin format: mmap sequential read)
     --dataloader.bucket_dir=${BUCKET_DIR}
-    --dataloader.within_bucket_order=random
+    --dataloader.within_bucket_order=sequential
     # PMP enabled
     --cluster.pmp.enabled
     --cluster.pmp.update_interval=${PMP_UPDATE_INTERVAL}
