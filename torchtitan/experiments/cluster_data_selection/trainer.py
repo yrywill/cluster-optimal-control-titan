@@ -27,6 +27,9 @@ Design rules
 
 from __future__ import annotations
 
+import json
+import os
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -132,6 +135,7 @@ class ClusterSelectionTrainer(Trainer):
             temperature=pmp_cfg.temperature,
             min_weight=pmp_cfg.min_weight,
             accumulate=pmp_cfg.accumulate_grad_gamma,
+            gamma_decay=pmp_cfg.gamma_decay,
             drop_bad_clusters=pmp_cfg.drop_bad_clusters,
             drop_patience=pmp_cfg.drop_patience,
         )
@@ -179,6 +183,20 @@ class ClusterSelectionTrainer(Trainer):
                 config.training.steps,
             )
 
+        # Weight history log: append a JSONL record each time weights change.
+        # Only rank 0 writes to avoid file contention in distributed training.
+        self._weight_history_path = os.path.join(
+            config.dump_folder, "cluster_weight_history.jsonl"
+        )
+        self._is_rank0 = (
+            not torch.distributed.is_initialized()
+            or torch.distributed.get_rank() == 0
+        )
+        if self._is_rank0:
+            os.makedirs(os.path.dirname(self._weight_history_path), exist_ok=True)
+        # Log the initial weights (step=0, before any PMP update).
+        self._save_weight_snapshot(step=0, event="init")
+
         logger.info(
             "[ClusterSelectionTrainer] ready: num_clusters=%d, PMP enabled=%s, "
             "update_interval=%d",
@@ -186,6 +204,115 @@ class ClusterSelectionTrainer(Trainer):
             pmp_cfg.enabled,
             pmp_cfg.update_interval,
         )
+
+    # ------------------------------------------------------------------
+    # Training analytics logging
+    # ------------------------------------------------------------------
+    def _save_weight_snapshot(
+        self,
+        step: int,
+        event: str = "pmp_update",
+        grad_gamma_delta: "torch.Tensor | None" = None,
+    ) -> None:
+        """Append a JSON record of current cluster weights to the history file.
+
+        Each line contains: step, event type, timestamp, weights, grad_gamma,
+        dead-cluster mask, and (for PMP events) per-cluster contribution delta
+        — enough to reconstruct the full weight trajectory and analyze dynamics.
+        """
+        if not self._is_rank0:
+            return
+
+        import numpy as np
+
+        weights = self.cluster_weight_state.weights
+        grad_gamma = self.cluster_weight_state.grad_gamma
+
+        # Compute analytics metrics
+        # Weight entropy: H = -sum(w * log(w)), higher = more uniform
+        w_safe = np.clip(weights, 1e-10, None)
+        entropy = float(-np.sum(w_safe * np.log(w_safe)))
+
+        # Effective number of clusters: exp(H), 1 = collapsed, K = uniform
+        effective_k = float(np.exp(entropy))
+
+        # Weight concentration: max/min ratio among alive clusters
+        alive_mask = ~self.cluster_weight_state.dead
+        alive_w = weights[alive_mask] if alive_mask.any() else weights
+        concentration = float(alive_w.max() / max(alive_w.min(), 1e-10))
+
+        record = {
+            "step": step,
+            "event": event,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "weights": weights.tolist(),
+            "grad_gamma": grad_gamma.tolist(),
+            "dead": self.cluster_weight_state.dead.tolist(),
+            # Analytics
+            "entropy": entropy,
+            "effective_k": effective_k,
+            "concentration": concentration,
+            "num_dead": int(self.cluster_weight_state.dead.sum()),
+            "weight_std": float(weights.std()),
+            "weight_top10_share": float(np.sort(weights)[-10:].sum()),
+        }
+
+        # Per-cluster contribution delta (only for PMP updates)
+        if grad_gamma_delta is not None:
+            if isinstance(grad_gamma_delta, torch.Tensor):
+                delta = grad_gamma_delta.detach().cpu().numpy()
+            else:
+                delta = np.asarray(grad_gamma_delta)
+            record["grad_gamma_delta"] = delta.tolist()
+            record["delta_norm"] = float(np.linalg.norm(delta))
+            # Top-5 gaining / losing clusters
+            top5_gain = np.argsort(delta)[-5:][::-1].tolist()
+            top5_lose = np.argsort(delta)[:5].tolist()
+            record["top5_gaining_clusters"] = top5_gain
+            record["top5_losing_clusters"] = top5_lose
+
+        try:
+            with open(self._weight_history_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        except OSError as e:
+            logger.warning(
+                "[ClusterSelectionTrainer] failed to write weight history: %s", e
+            )
+
+    def _save_training_metrics(self, step: int, loss: float) -> None:
+        """Save per-step training metrics for analysis.
+
+        Logs: step, loss, current sampling distribution stats.
+        Written to a separate lightweight CSV for easy plotting.
+        """
+        if not self._is_rank0:
+            return
+        metrics_path = os.path.join(
+            os.path.dirname(self._weight_history_path), "training_metrics.csv"
+        )
+        # Write header on first call
+        if not hasattr(self, "_metrics_header_written"):
+            try:
+                with open(metrics_path, "w") as f:
+                    f.write("step,loss,weight_entropy,effective_k,concentration,num_dead\n")
+                self._metrics_header_written = True
+            except OSError:
+                return
+
+        import numpy as np
+
+        weights = self.cluster_weight_state.weights
+        w_safe = np.clip(weights, 1e-10, None)
+        entropy = float(-np.sum(w_safe * np.log(w_safe)))
+        effective_k = float(np.exp(entropy))
+        alive_w = weights[~self.cluster_weight_state.dead]
+        concentration = float(alive_w.max() / max(alive_w.min(), 1e-10)) if len(alive_w) > 0 else 0.0
+
+        try:
+            with open(metrics_path, "a") as f:
+                f.write(f"{step},{loss:.6f},{entropy:.4f},{effective_k:.1f},{concentration:.2f},{int(self.cluster_weight_state.dead.sum())}\n")
+        except OSError:
+            pass
 
     # ------------------------------------------------------------------
     # PMP hook
@@ -244,12 +371,20 @@ class ClusterSelectionTrainer(Trainer):
             n_samples_per_cluster=pmp.n_samples_per_cluster,
             dp_mesh=dp_mesh,
             device=self.device,
+            # When torch.compile is active, skip model.eval() to avoid
+            # recompiling all TransformerBlocks. Llama3 has no dropout so
+            # train/eval produce identical results.
+            skip_eval_mode=self.config.compile.enable,
         )
 
         self.cluster_weight_state.update(grad_gamma_delta)
         # Broadcast into the on-disk sampler.
         self._cluster_dataset_ref.update_weights(
             self.cluster_weight_state.weights
+        )
+        # Log the updated weights to history file (include delta for analysis).
+        self._save_weight_snapshot(
+            step=self.step, event="pmp_update", grad_gamma_delta=grad_gamma_delta
         )
         # Drop any graph the sketcher may have pinned.
         del grad_gamma_delta
@@ -288,3 +423,5 @@ class ClusterSelectionTrainer(Trainer):
             self._cluster_dataset_ref.update_weights(
                 self.cluster_weight_state.weights
             )
+            # Log the restored weights so history is continuous after resume.
+            self._save_weight_snapshot(step=self.step, event="checkpoint_restore")

@@ -34,6 +34,7 @@ DEV_DIR=${DEV_DIR:-"/apdcephfs_jn4/share_304380933/rongyiyu/code/cluster_data_se
 PMP_UPDATE_INTERVAL=${PMP_UPDATE_INTERVAL:-"1000"}
 PMP_LR=${PMP_LR:-"0.01"}
 PMP_TEMPERATURE=${PMP_TEMPERATURE:-"1"}
+PMP_GAMMA_DECAY=${PMP_GAMMA_DECAY:-"0.95"}
 PMP_SKETCH_DIM=${PMP_SKETCH_DIM:-"8192"}
 PMP_N_SAMPLES=${PMP_N_SAMPLES:-"4"}
 PMP_DEV_BATCH_SIZE=${PMP_DEV_BATCH_SIZE:-"8"}
@@ -134,7 +135,7 @@ echo " Global batch = ${TRAIN_LOCAL_BATCH_SIZE} * ${GRAD_ACCUM_STEPS} * 8 * ${DP
 echo " LR: ${TRAIN_LR}, Steps: ${TRAIN_STEPS}, Warmup: ${TRAIN_WARMUP_STEPS}"
 echo " Data: ${BUCKET_DIR}"
 echo " Dev: ${DEV_DIR}"
-echo " PMP: interval=${PMP_UPDATE_INTERVAL}, lr=${PMP_LR}, temp=${PMP_TEMPERATURE}"
+echo " PMP: interval=${PMP_UPDATE_INTERVAL}, lr=${PMP_LR}, temp=${PMP_TEMPERATURE}, decay=${PMP_GAMMA_DECAY}"
 echo " Save: ${DUMP_FOLDER} (DCP every ${CKPT_INTERVAL} steps)"
 echo " Node rank: ${NODE_RANK}, Master: ${MASTER_ADDR}:${MASTER_PORT}"
 echo "============================================================"
@@ -199,6 +200,7 @@ TRAIN_ARGS=(
     --cluster.pmp.update_interval=${PMP_UPDATE_INTERVAL}
     --cluster.pmp.lr=${PMP_LR}
     --cluster.pmp.temperature=${PMP_TEMPERATURE}
+    --cluster.pmp.gamma_decay=${PMP_GAMMA_DECAY}
     --cluster.pmp.sketch_dim=${PMP_SKETCH_DIM}
     --cluster.pmp.n_samples_per_cluster=${PMP_N_SAMPLES}
     --cluster.pmp.dev_batch_size=${PMP_DEV_BATCH_SIZE}

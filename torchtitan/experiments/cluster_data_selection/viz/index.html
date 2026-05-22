@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cluster Explorer</title>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --bg: #0f172a;
+            --bg2: #1e293b;
+            --bg3: #334155;
+            --text: #f1f5f9;
+            --text2: #94a3b8;
+            --accent: #38bdf8;
+            --accent2: #818cf8;
+            --green: #34d399;
+            --orange: #fb923c;
+            --red: #f87171;
+            --border: #475569;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            background: var(--bg); color: var(--text);
+            line-height: 1.6; overflow: hidden; height: 100vh;
+        }
+        .app { display: grid; grid-template-rows: auto 1fr; height: 100vh; }
+        /* Header */
+        .header {
+            padding: 14px 24px; background: var(--bg2);
+            border-bottom: 1px solid var(--border);
+            display: flex; align-items: center; gap: 20px;
+        }
+        .logo { font-size: 20px; font-weight: 700; color: var(--accent); white-space: nowrap; }
+        .stats { display: flex; gap: 12px; flex-wrap: wrap; }
+        .stat {
+            background: var(--bg3); padding: 3px 10px; border-radius: 6px;
+            font-size: 12px; color: var(--text2);
+        }
+        .stat b { color: var(--text); }
+        /* Main */
+        .main { display: grid; grid-template-columns: 1fr 360px; overflow: hidden; }
+        @media (max-width: 900px) { .main { grid-template-columns: 1fr; } .side-panel { display: none; } }
+        /* Chart */
+        .chart-panel { position: relative; overflow: hidden; }
+        #chart { width: 100%; height: 100%; }
+        .controls {
+            position: absolute; top: 12px; left: 12px; z-index: 10;
+            display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+        }
+        .search-box {
+            background: var(--bg2); border: 1px solid var(--border);
+            border-radius: 8px; padding: 7px 14px; font-size: 13px;
+            color: var(--text); width: 240px; outline: none;
+        }
+        .search-box:focus { border-color: var(--accent); }
+        .search-box::placeholder { color: var(--text2); }
+        .filter-btn {
+            background: var(--bg2); border: 1px solid var(--border);
+            border-radius: 8px; padding: 7px 12px; font-size: 12px;
+            color: var(--text2); cursor: pointer; transition: all 0.15s;
+        }
+        .filter-btn:hover, .filter-btn.active { border-color: var(--accent); color: var(--accent); }
+        .legend {
+            position: absolute; bottom: 12px; right: 12px; z-index: 10;
+            background: var(--bg2); border: 1px solid var(--border);
+            border-radius: 8px; padding: 10px 14px; font-size: 11px;
+        }
+        .legend-item { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; }
+        .legend-dot { width: 8px; height: 8px; border-radius: 50%; }
+        /* Side panel */
+        .side-panel {
+            background: var(--bg2); border-left: 1px solid var(--border);
+            display: flex; flex-direction: column; overflow: hidden;
+        }
+        .panel-head {
+            padding: 10px 14px; border-bottom: 1px solid var(--border);
+            display: flex; justify-content: space-between; align-items: center;
+            font-size: 13px; font-weight: 600; color: var(--text2);
+        }
+        .cluster-list { flex: 1; overflow-y: auto; padding: 6px; }
+        .cl-item {
+            padding: 8px 10px; border-radius: 8px; cursor: pointer;
+            margin-bottom: 3px; display: flex; align-items: center; gap: 8px;
+            transition: background 0.12s;
+        }
+        .cl-item:hover { background: var(--bg3); }
+        .cl-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+        .cl-info { flex: 1; min-width: 0; }
+        .cl-name { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .cl-meta { font-size: 11px; color: var(--text2); }
+        .pager {
+            padding: 8px 12px; border-top: 1px solid var(--border);
+            display: flex; align-items: center; justify-content: center; gap: 6px;
+        }
+        .pg-btn {
+            background: var(--bg3); border: none; color: var(--text);
+            padding: 3px 8px; border-radius: 5px; cursor: pointer; font-size: 11px;
+        }
+        .pg-btn:disabled { opacity: 0.3; cursor: default; }
+        .pg-info { font-size: 11px; color: var(--text2); }
+        /* Modal */
+        .modal-bg {
+            position: fixed; inset: 0; background: rgba(0,0,0,0.7);
+            backdrop-filter: blur(3px); z-index: 100;
+            display: flex; align-items: center; justify-content: center;
+            opacity: 0; pointer-events: none; transition: opacity 0.2s;
+        }
+        .modal-bg.show { opacity: 1; pointer-events: auto; }
+        .modal {
+            background: var(--bg2); border-radius: 14px; border: 1px solid var(--border);
+            width: 90vw; max-width: 760px; max-height: 80vh;
+            display: flex; flex-direction: column; overflow: hidden;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.5);
+        }
+        .m-head {
+            padding: 18px 22px; border-bottom: 1px solid var(--border);
+            display: flex; justify-content: space-between; align-items: flex-start;
+        }
+        .m-title { font-size: 17px; font-weight: 700; color: var(--accent); }
+        .m-sub { font-size: 12px; color: var(--text2); margin-top: 3px; }
+        .m-close {
+            background: none; border: none; color: var(--text2); font-size: 22px;
+            cursor: pointer; padding: 2px 8px; border-radius: 6px;
+        }
+        .m-close:hover { background: var(--bg3); color: var(--text); }
+        .m-kw { display: flex; gap: 5px; flex-wrap: wrap; padding: 10px 22px; border-bottom: 1px solid var(--border); }
+        .kw { background: var(--bg3); padding: 2px 9px; border-radius: 10px; font-size: 11px; color: var(--accent); }
+        .m-body { flex: 1; overflow-y: auto; padding: 14px 22px; }
+        .sample {
+            padding: 10px 14px; background: var(--bg); border-radius: 8px;
+            margin-bottom: 7px; font-size: 12px; line-height: 1.7;
+            color: var(--text2); border-left: 3px solid var(--accent2);
+        }
+        .s-idx { font-size: 10px; color: var(--accent); font-weight: 600; margin-bottom: 3px; display: flex; align-items: center; gap: 8px; }
+        .translate-btn {
+            background: var(--bg3); border: 1px solid var(--border); color: var(--accent);
+            padding: 1px 8px; border-radius: 4px; font-size: 10px; cursor: pointer;
+            transition: all 0.15s;
+        }
+        .translate-btn:hover { background: var(--accent); color: var(--bg); }
+        .translate-btn:disabled { opacity: 0.5; cursor: wait; }
+        .m-loading { padding: 30px; text-align: center; color: var(--text2); font-size: 13px; }
+        /* Loading screen */
+        .loading-screen {
+            display: flex; align-items: center; justify-content: center;
+            height: 100vh; flex-direction: column; gap: 14px;
+        }
+        .spin {
+            width: 36px; height: 36px; border: 3px solid var(--bg3);
+            border-top-color: var(--accent); border-radius: 50%;
+            animation: sp 0.7s linear infinite;
+        }
+        @keyframes sp { to { transform: rotate(360deg); } }
+        ::-webkit-scrollbar { width: 5px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--bg3); border-radius: 3px; }
+    </style>
+</head>
+<body>
+    <div id="loading" class="loading-screen">
+        <div class="spin"></div>
+        <div style="color:var(--text2);font-size:13px;">Loading clusters...</div>
+    </div>
+    <div id="app" class="app" style="display:none;">
+        <div class="header">
+            <div class="logo">⚛ Cluster Explorer</div>
+            <div class="stats" id="stats"></div>
+        </div>
+        <div class="main">
+            <div class="chart-panel">
+                <div class="controls">
+                    <input type="text" class="search-box" id="search" placeholder="Search by keyword...">
+                    <button class="filter-btn" data-min="0" onclick="setFilter(this,0)">All</button>
+                    <button class="filter-btn" data-min="1000" onclick="setFilter(this,1000)">1K+</button>
+                    <button class="filter-btn" data-min="10000" onclick="setFilter(this,10000)">10K+</button>
+                    <button class="filter-btn" data-min="50000" onclick="setFilter(this,50000)">50K+</button>
+                </div>
+                <div class="legend">
+                    <div class="legend-item"><div class="legend-dot" style="background:#38bdf8"></div> 50K+</div>
+                    <div class="legend-item"><div class="legend-dot" style="background:#818cf8"></div> 10K-50K</div>
+                    <div class="legend-item"><div class="legend-dot" style="background:#34d399"></div> 1K-10K</div>
+                    <div class="legend-item"><div class="legend-dot" style="background:#fb923c"></div> 100-1K</div>
+                    <div class="legend-item"><div class="legend-dot" style="background:#f87171"></div> &lt;100</div>
+                </div>
+                <div id="chart"></div>
+            </div>
+            <div class="side-panel">
+                <div class="panel-head">
+                    <span>Clusters</span>
+                    <span id="listCount"></span>
+                </div>
+                <div class="cluster-list" id="clusterList"></div>
+                <div class="pager" id="pager"></div>
+            </div>
+        </div>
+    </div>
+    <div class="modal-bg" id="modal">
+        <div class="modal">
+            <div class="m-head">
+                <div><div class="m-title" id="mTitle"></div><div class="m-sub" id="mSub"></div></div>
+                <button class="m-close" onclick="closeModal()">×</button>
+            </div>
+            <div class="m-kw" id="mKw"></div>
+            <div class="m-body" id="mBody"></div>
+        </div>
+    </div>
+<script>
+let DATA=null, filtered=[], page=0, chart=null;
+const PS=50, detailCache={};
+const CHUNK_SIZE=200;
+
+function color(s){
+    if(s>=50000)return'#38bdf8';
+    if(s>=10000)return'#818cf8';
+    if(s>=1000)return'#34d399';
+    if(s>=100)return'#fb923c';
+    return'#f87171';
+}
+
+async function load(){
+    try{
+        const r=await fetch('clusters_summary.json');
+        DATA=await r.json();
+        init();
+    }catch(e){
+        document.getElementById('loading').innerHTML=
+            `<div style="color:#f87171;padding:20px;text-align:center;">
+            Failed to load.<br>Run: <code>python scripts/build_cluster_viz_data.py</code></div>`;
+    }
+}
+
+function init(){
+    document.getElementById('loading').style.display='none';
+    document.getElementById('app').style.display='grid';
+    document.getElementById('stats').innerHTML=`
+        <div class="stat"><b>${DATA.total_clusters.toLocaleString()}</b> clusters</div>
+        <div class="stat"><b>${(DATA.total_samples/1e6).toFixed(0)}M</b> samples</div>
+        <div class="stat"><b>${DATA.clusters_with_data.toLocaleString()}</b> with text</div>`;
+    filtered=DATA.clusters;
+    // Default filter: All
+    document.querySelector('.filter-btn[data-min="0"]').classList.add('active');
+    initChart(); renderList();
+    document.getElementById('search').addEventListener('input',filter);
+    document.getElementById('modal').addEventListener('click',e=>{if(e.target===e.currentTarget)closeModal();});
+    document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal();});
+}
+
+let minFilter=0;
+function setFilter(btn,min){
+    document.querySelectorAll('.filter-btn').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    minFilter=min; filter();
+}
+
+function filter(){
+    const q=document.getElementById('search').value.toLowerCase().trim();
+    filtered=DATA.clusters.filter(c=>{
+        if(c.size<minFilter)return false;
+        if(q&&!c.name.toLowerCase().includes(q)&&!c.keywords.some(k=>k.includes(q)))return false;
+        return true;
+    });
+    page=0; renderList(); updateChart();
+}
+
+function initChart(){
+    chart=echarts.init(document.getElementById('chart'));
+    updateChart();
+    window.addEventListener('resize',()=>chart.resize());
+}
+
+function updateChart(){
+    // Show max 3000 for performance
+    const show=filtered.slice(0,3000);
+    // Layout: pack circles using simple random + size-based positioning
+    // Group by size bracket for clustering effect
+    const data=show.map((c,i)=>{
+        const angle=Math.random()*Math.PI*2;
+        const r=30+Math.random()*35;
+        return{
+            value:[50+r*Math.cos(angle)+Math.random()*15, 50+r*Math.sin(angle)+Math.random()*15, c.size],
+            name:c.name,
+            itemStyle:{color:color(c.size),opacity:0.7},
+            _id:c.id
+        };
+    });
+    chart.setOption({
+        backgroundColor:'transparent',
+        tooltip:{
+            trigger:'item',backgroundColor:'#1e293b',borderColor:'#475569',
+            textStyle:{color:'#f1f5f9',fontSize:12},
+            formatter:p=>{const c=DATA.clusters.find(x=>x.id===p.data._id);
+                return c?`<b>${c.name}</b><br>#${c.id} · ${c.size.toLocaleString()} samples`:'';
+            }
+        },
+        dataZoom:[
+            {type:'inside',xAxisIndex:0,minSpan:5},
+            {type:'inside',yAxisIndex:0,minSpan:5},
+            {type:'slider',xAxisIndex:0,bottom:10,height:16,borderColor:'#475569',fillerColor:'rgba(56,189,248,0.15)',handleStyle:{color:'#38bdf8'}},
+            {type:'slider',yAxisIndex:0,right:10,width:16,borderColor:'#475569',fillerColor:'rgba(56,189,248,0.15)',handleStyle:{color:'#38bdf8'}}
+        ],
+        xAxis:{show:false,min:-5,max:105},
+        yAxis:{show:false,min:-5,max:105},
+        series:[{
+            type:'scatter',data,
+            symbolSize:v=>Math.max(3,Math.min(28,Math.sqrt(v[2])/9)),
+            emphasis:{itemStyle:{opacity:1,borderColor:'#fff',borderWidth:2}},
+            animationDuration:600,
+        }]
+    },true);
+    chart.off('click');
+    chart.on('click',p=>{if(p.data)openModal(p.data._id);});
+}
+
+function renderList(){
+    const el=document.getElementById('clusterList');
+    const s=page*PS, e=Math.min(s+PS,filtered.length);
+    document.getElementById('listCount').textContent=filtered.length.toLocaleString();
+    el.innerHTML=filtered.slice(s,e).map(c=>`
+        <div class="cl-item" onclick="openModal(${c.id})">
+            <div class="cl-dot" style="background:${color(c.size)}"></div>
+            <div class="cl-info">
+                <div class="cl-name">${esc(c.name)}</div>
+                <div class="cl-meta">#${c.id} · ${c.size.toLocaleString()}</div>
+            </div>
+        </div>`).join('');
+    const tp=Math.ceil(filtered.length/PS);
+    document.getElementById('pager').innerHTML=`
+        <button class="pg-btn" onclick="go(${page-1})" ${page<=0?'disabled':''}>◀</button>
+        <span class="pg-info">${page+1}/${tp}</span>
+        <button class="pg-btn" onclick="go(${page+1})" ${page>=tp-1?'disabled':''}>▶</button>`;
+}
+
+function go(p){const tp=Math.ceil(filtered.length/PS);if(p>=0&&p<tp){page=p;renderList();}}
+
+async function openModal(id){
+    const c=DATA.clusters.find(x=>x.id===id);
+    if(!c)return;
+    document.getElementById('mTitle').textContent=c.name;
+    document.getElementById('mSub').textContent=`Cluster #${c.id} · ${c.size.toLocaleString()} samples`;
+    document.getElementById('mKw').innerHTML=c.keywords.map(k=>`<span class="kw">${k}</span>`).join('');
+    document.getElementById('mBody').innerHTML='<div class="m-loading"><div class="spin" style="width:24px;height:24px;margin:0 auto 10px"></div>Loading samples...</div>';
+    document.getElementById('modal').classList.add('show');
+    // Load detail
+    const samples=await loadDetail(id);
+    if(samples&&samples.length){
+        document.getElementById('mBody').innerHTML=samples.map((t,i)=>
+            `<div class="sample"><div class="s-idx">#${i+1} <button class="translate-btn" onclick="translateSample(this,'${btoa(encodeURIComponent(t.slice(0,1500)))}')">翻译</button></div><div class="s-text">${esc(t)}</div><div class="s-trans" style="display:none;"></div></div>`).join('');
+    }else{
+        document.getElementById('mBody').innerHTML='<div class="m-loading">No samples available.</div>';
+    }
+}
+
+async function loadDetail(id){
+    // Find which chunk this cluster is in (clusters are sorted by size desc)
+    const idx=DATA.clusters.findIndex(c=>c.id===id);
+    if(idx<0)return null;
+    const chunkIdx=Math.floor(idx/CHUNK_SIZE);
+    const key=`chunk_${String(chunkIdx).padStart(3,'0')}`;
+    if(!detailCache[key]){
+        try{
+            const r=await fetch(`details/${key}.json`);
+            detailCache[key]=await r.json();
+        }catch(e){return null;}
+    }
+    return detailCache[key][id]||null;
+}
+
+function closeModal(){document.getElementById('modal').classList.remove('show');}
+function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+
+async function translateSample(btn, encodedText){
+    const text=decodeURIComponent(atob(encodedText));
+    const transDiv=btn.closest('.sample').querySelector('.s-trans');
+    if(transDiv.style.display!=='none'){
+        transDiv.style.display='none';
+        btn.textContent='翻译';
+        return;
+    }
+    btn.textContent='翻译中...';
+    btn.disabled=true;
+    try{
+        // Use Google Translate API (free, no key needed for small requests)
+        const url=`https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=zh-CN&dt=t&q=${encodeURIComponent(text)}`;
+        const r=await fetch(url);
+        const data=await r.json();
+        const translated=data[0].map(s=>s[0]).join('');
+        transDiv.innerHTML=`<div style="margin-top:8px;padding:8px 10px;background:#1a2744;border-left:3px solid #38bdf8;border-radius:4px;color:#93c5fd;font-size:12px;line-height:1.7;"><b style="color:#38bdf8;">中文翻译：</b><br>${esc(translated)}</div>`;
+        transDiv.style.display='block';
+        btn.textContent='收起翻译';
+    }catch(e){
+        transDiv.innerHTML=`<div style="margin-top:6px;color:#f87171;font-size:11px;">翻译失败: ${e.message}</div>`;
+        transDiv.style.display='block';
+        btn.textContent='重试';
+    }
+    btn.disabled=false;
+}
+
+load();
+</script>
+</body>
+</html>

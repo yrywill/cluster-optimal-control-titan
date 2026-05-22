@@ -77,6 +77,16 @@ class PMPConfig:
     accumulate_grad_gamma: bool = True
     """If True, accumulate ``grad_gamma`` across PMP calls; else reset every call."""
 
+    gamma_decay: float = 1.0
+    """Exponential decay applied to historical grad_gamma before adding new delta.
+
+    At each PMP step: grad_gamma = gamma_decay * grad_gamma + delta.
+    - 1.0: no decay, pure accumulation (original behavior).
+    - 0.9: recent signals weigh ~10x more than 20-step-old signals.
+    - 0.95: recent signals weigh ~10x more than 45-step-old signals.
+    Useful when cluster utility changes over training (e.g. easy clusters
+    become less useful as the model improves)."""
+
     drop_bad_clusters: bool = True
     """Permanently drop clusters with consecutive negative contributions."""
 

@@ -118,6 +118,7 @@ def compute_cluster_contributions_sketch(
     n_samples_per_cluster: int,
     dp_mesh: DeviceMesh | None,
     device: torch.device,
+    skip_eval_mode: bool = False,
 ) -> torch.Tensor:
     """Return ``grad_gamma_delta`` of shape ``[num_clusters]``.
 
@@ -136,9 +137,13 @@ def compute_cluster_contributions_sketch(
         dp_mesh: DP (batch) mesh used for all reductions.  ``None`` means
             single-process debug mode; we skip collectives then.
         device: Target device for all PMP tensors.
+        skip_eval_mode: If True, keep the model in train mode during PMP.
+            This avoids torch.compile recompilation when the model has no
+            train/eval-dependent behavior (e.g. Llama3 has no dropout).
     """
     was_training = model.training
-    model.eval()
+    if not skip_eval_mode:
+        model.eval()
     try:
         dp_rank = dp_mesh.get_local_rank() if dp_mesh is not None else 0
         dp_world_size = dp_mesh.size() if dp_mesh is not None else 1
@@ -248,5 +253,5 @@ def compute_cluster_contributions_sketch(
         )
         return grad_gamma_delta
     finally:
-        if was_training:
+        if not skip_eval_mode and was_training:
             model.train()

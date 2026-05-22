@@ -9,10 +9,20 @@
 ``grad_gamma`` is the accumulator of per-cluster contributions.  After each
 PMP step we convert it into a sampling distribution by
 
-    w_k ∝ exp( -grad_gamma[k] / τ )
+    w_k ∝ exp( grad_gamma[k] / τ )
 
-with an optional floor ``min_weight`` and "dead-cluster" dropping to avoid
-starvation on clusters that keep hurting the validation objective.
+where positive grad_gamma means the cluster is beneficial for the dev
+objective — so it receives higher sampling weight.  An optional floor
+``min_weight`` prevents starvation, and ``drop_bad_clusters`` permanently
+removes clusters that consistently hurt validation.
+
+A decay factor ``gamma_decay`` (default 1.0 = no decay) applies exponential
+discounting on historical grad_gamma each PMP step:
+
+    grad_gamma = gamma_decay * grad_gamma + delta
+
+This makes recent PMP signals weigh more than stale ones, allowing the
+distribution to adapt as training progresses and cluster utility changes.
 
 The state lives in a simple dataclass so it is trivially picklable /
 stateful — the trainer persists it through torchtitan's DCP mechanism.
@@ -36,6 +46,7 @@ class ClusterWeightState:
     temperature: float = 0.5
     min_weight: float = 0.01
     accumulate: bool = True
+    gamma_decay: float = 1.0
     drop_bad_clusters: bool = False
     drop_patience: int = 5
 
@@ -68,7 +79,11 @@ class ClusterWeightState:
             )
 
         if self.accumulate:
-            self.grad_gamma += delta
+            # Exponential decay on historical gamma before adding new delta.
+            # decay=1.0 means no decay (pure accumulation, original behavior).
+            # decay<1.0 (e.g. 0.9) discounts stale signals so recent PMP
+            # updates dominate — useful when cluster utility shifts over time.
+            self.grad_gamma = self.gamma_decay * self.grad_gamma + delta
         else:
             self.grad_gamma = delta.copy()
 
@@ -93,7 +108,8 @@ class ClusterWeightState:
                 )
 
         # Softmax weights.
-        logits = -self.grad_gamma / max(self.temperature, 1e-6)
+        # Positive grad_gamma → cluster is beneficial → higher weight.
+        logits = self.grad_gamma / max(self.temperature, 1e-6)
         logits -= logits.max()
         w = np.exp(logits)
         w = np.clip(w, a_min=self.min_weight, a_max=None)
